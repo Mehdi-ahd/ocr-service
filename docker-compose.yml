@@ -1,0 +1,19 @@
+services:
+  ocr:
+    build: .
+    container_name: foncier-ocr
+    ports:
+      - "${OCR_PORT:-8001}:8000"
+    environment:
+      OCR_TOKEN: "${OCR_TOKEN:-}"
+      OCR_LANGS: "${OCR_LANGS:-fra+eng}"
+      TESSERACT_BINARY: "tesseract"
+      PDFTOPPM_PATH: "pdftoppm"
+    volumes:
+      - ./app:/app/app:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
