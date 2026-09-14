@@ -5,9 +5,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import httpx
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "bmp", "pdf"}
 ALLOWED_LANGUAGES = {"fra", "eng", "fra+eng", "eng+fra"}
@@ -163,6 +164,120 @@ async def extract(
                     Path(p).unlink()
                 except Exception:
                     pass
+
+
+def _ocr_and_callback(
+    tmp_path: str,
+    generated_png: str | None,
+    lang: str,
+    filename: str,
+    callback_url: str,
+    callback_token: str | None,
+    job_id: str | None,
+    document_id: str | None = None,
+) -> None:
+    """Tâche de fond : OCR puis POST vers callback_url."""
+    try:
+        image_path = tmp_path
+        if generated_png and Path(generated_png).exists():
+            image_path = generated_png
+        elif Path(tmp_path).suffix.lower() == ".pdf":
+            # Si le PDF n'a pas été converti avant (fallback)
+            try:
+                generated_png = _convert_pdf_to_png(tmp_path)
+                image_path = generated_png
+            except Exception as e:
+                _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": f"pdftoppm failed: {e}", "status": "error"})
+                return
+
+        text, confidence = _run_tesseract(image_path, lang)
+        payload: dict = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
+        if document_id:
+            payload["documentId"] = document_id
+        _post_callback(callback_url, callback_token, payload)
+    except subprocess.TimeoutExpired:
+        _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": "OCR timeout", "status": "error"})
+    except Exception as exc:
+        _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": str(exc)[:500], "status": "error"})
+    finally:
+        for p in [tmp_path, generated_png]:
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
+
+
+def _post_callback(callback_url: str, callback_token: str | None, payload: dict) -> None:
+    headers = {"Content-Type": "application/json"}
+    if callback_token:
+        headers["Authorization"] = f"Bearer {callback_token}"
+    try:
+        # Fire-and-forget, timeout 10s pour le POST callback
+        httpx.post(callback_url, json=payload, headers=headers, timeout=10)
+    except Exception:
+        pass
+
+
+@app.post("/receive")
+async def receive(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    language: str = Form(default="fra"),
+    callback_url: str = Form(...),
+    job_id: str = Form(default=""),
+    callback_token: str = Form(default=""),
+    document_id: str = Form(default=""),
+    _: None = Depends(verify_token),
+) -> JSONResponse:
+    """Réception async : 202 immédiat puis OCR en tâche de fond qui rappelle callback_url."""
+    lang = _sanitize_language(language)
+    filename = file.filename or "upload"
+    ext = Path(filename).suffix.lower().lstrip(".")
+    if ext not in ALLOWED_EXTENSIONS:
+        if file.content_type and "pdf" in file.content_type:
+            ext = "pdf"
+        elif ext == "":
+            ext = "png"
+        else:
+            raise HTTPException(status_code=400, detail=f"Extension non supportée: .{ext}")
+
+    suffix = f".{ext}"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Fichier vide")
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Fichier trop volumineux (max 10MB)")
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    generated_png: str | None = None
+    # Pré-conversion PDF pour ne pas bloquer le thread principal sur pdftoppm
+    if ext == "pdf":
+        try:
+            generated_png = _convert_pdf_to_png(tmp_path)
+        except Exception as exc:
+            # On laisse la tâche de fond gérer l'erreur et notifier le callback
+            pass
+
+    # Validation callback_url
+    if not callback_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="callback_url invalide")
+
+    background_tasks.add_task(
+        _ocr_and_callback,
+        tmp_path,
+        generated_png,
+        lang,
+        filename,
+        callback_url,
+        callback_token or None,
+        job_id or None,
+        document_id or None,
+    )
+
+    return JSONResponse({"received": True, "jobId": job_id or None, "filename": filename}, status_code=202)
 
 
 @app.get("/")
