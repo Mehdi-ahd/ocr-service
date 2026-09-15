@@ -226,13 +226,21 @@ def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
 
 @app.get("/health")
 def health() -> dict:
-    tesseract_bin = os.getenv("TESSERACT_BINARY", "tesseract")
-    pdftoppm_bin = os.getenv("PDFTOPPM_PATH", "pdftoppm")
     checks: dict[str, str] = {}
-    for name, bin_path in [("tesseract", tesseract_bin), ("pdftoppm", pdftoppm_bin)]:
-        proc = subprocess.run(f"which {shlex.quote(bin_path)} 2>/dev/null; {shlex.quote(bin_path)} --version 2>&1 | head -n1", shell=True, capture_output=True, text=True)
+    for name, bin_path, ver_arg in [
+        ("tesseract", os.getenv("TESSERACT_BINARY", "tesseract"), "--version"),
+        ("pdftoppm", os.getenv("PDFTOPPM_PATH", "pdftoppm"), "-v"),
+        ("ocrmypdf", "ocrmypdf", "--version"),
+        ("ghostscript", "gs", "--version"),
+    ]:
+        proc = subprocess.run(
+            f"which {shlex.quote(bin_path)} 2>/dev/null; {shlex.quote(bin_path)} {ver_arg} 2>&1 | head -n1",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
         checks[name] = proc.stdout.strip()[:200] or "not found"
-    return {"status": "ok", "service": "foncier-ocr", "checks": checks}
+    return {"status": "ok", "service": "foncier-ocr", "version": "2.0.0-ocrmypdf", "checks": checks}
 
 
 @app.post("/extract")
