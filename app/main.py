@@ -1,5 +1,4 @@
 import os
-import re
 import shlex
 import subprocess
 import tempfile
@@ -9,18 +8,16 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPE
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
-from PIL import Image, ImageEnhance, ImageOps
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "bmp", "pdf"}
 ALLOWED_LANGUAGES = {"fra", "eng", "fra+eng", "eng+fra"}
 
 app = FastAPI(
     title="Foncier OCR Micro-service",
-    description="OCRmyPDF + Tesseract + pdftoppm — utilisé par Laravel OcrService en mode http (InfinityFree).",
-    version="2.0.0",
+    description="OCRmyPDF exclusif (force-ocr + sidecar) — utilisé par Laravel OcrService en mode http (InfinityFree).",
+    version="3.0.0",
 )
 
-# CORS — autorise InfinityFree + local dev ; resserrer via OCR_CORS_ORIGINS si besoin
 cors_origins = [o.strip() for o in os.getenv("OCR_CORS_ORIGINS", "*").split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -45,93 +42,52 @@ def verify_token(authorization: str | None = Header(default=None)) -> None:
 def _sanitize_language(lang: str) -> str:
     lang = lang.strip().lower()
     if lang not in ALLOWED_LANGUAGES:
-        # accepte "fra" ou "eng" seul, sinon fallback
         if lang in {"fra", "eng"}:
             return lang
         return "fra"
     return lang
 
 
-def _preprocess_image(image_path: str) -> str | None:
-    """Prétraitement léger Pillow (mayaram/laravel-ocr-like) : grayscale -> upscale 2x si <2000px -> autocontrast -> contraste x1.5 -> sharpen.
-
-    Binarisation/median désactivés par défaut (provoquaient 6807→6307). Activer via OCR_BINARIZE_THRESHOLD=140 si besoin.
-    """
-    try:
-        img = Image.open(image_path)
-
-        if img.mode != "L":
-            img = img.convert("L")
-
-        if img.width < 2000:
-            img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-
-        img = ImageOps.autocontrast(img, cutoff=0.5)
-        img = ImageEnhance.Contrast(img).enhance(1.5)
-        img = img.filter(ImageFilter.SHARPEN)
-
-        # Opt-in : median + binarisation uniquement si seuil explicite
-        threshold = int(os.getenv("OCR_BINARIZE_THRESHOLD", "0"))
-        if 0 < threshold < 255:
-            img = img.filter(ImageFilter.MedianFilter(size=3))
-            img = img.point(lambda p, t=threshold: 255 if p > t else 0, mode="L")
-
-        out = tempfile.mktemp(prefix="ocr_pre_", suffix=".png")
-        img.save(out, "PNG", dpi=(300, 300))
-
-        return out
-    except Exception:
-        return None
-
-
-def _convert_pdf_to_png(pdf_path: str) -> str:
-    """Convertit la première page du PDF en PNG via pdftoppm. Retourne chemin PNG."""
-    pdftoppm = os.getenv("PDFTOPPM_PATH", "pdftoppm")
-    tmp_png_base = tempfile.mktemp(prefix="ocr_")  # pdftoppm ajoute .png
-    cmd = f"{shlex.quote(pdftoppm)} -png -r 300 -singlefile {shlex.quote(pdf_path)} {shlex.quote(tmp_png_base)} 2>/dev/null"
-    result = subprocess.run(cmd, shell=True)
-    generated = tmp_png_base + ".png"
-    if result.returncode != 0 or not Path(generated).exists():
-        raise RuntimeError(f"pdftoppm failed (code={result.returncode}) for {pdf_path}")
-    return generated
-
-
-def _ocr_pdf_with_ocrmypdf(pdf_path: str, language: str) -> tuple[str, float | None] | None:
-    """Tente OCRmyPDF --force-ocr avec sidecar. Retourne (text, None) ou None si échec/fallback."""
-    if os.getenv("OCR_USE_OCRMYPDF", "1").strip() in {"0", "false", "no"}:
-        return None
+def _ocr_pdf_with_ocrmypdf(pdf_path: str, language: str) -> str:
+    """OCR exclusif via OCRmyPDF --force-ocr + sidecar. Lève RuntimeError si échec."""
     sidecar = tempfile.mktemp(prefix="ocr_sidecar_", suffix=".txt")
     output_pdf = tempfile.mktemp(prefix="ocr_out_", suffix=".pdf")
-    # tesseract language pour ocrmypdf : fra ou fra+eng etc.
     lang = language.strip() or "fra"
-    # OCRmyPDF : deskew, clean, oversample 300dpi, force-ocr
+
+    # OCRmyPDF pipeline : force-ocr (ignore texte existant), deskew/clean auto, tesseract fra
+    # --optimize 0 : pas de recompression (qualité max) ; --oversample 300 pour images basse def
     cmd = [
         "ocrmypdf",
         "--force-ocr",
         "-l", lang,
         "--optimize", "0",
+        "--oversample", "300",
         "--output-type", "pdf",
         "--sidecar", sidecar,
-        "--tesseract-timeout", "60",
+        "--tesseract-timeout", "90",
+        "--jobs", "1",
         pdf_path,
         output_pdf,
     ]
-    # Option: désactiver le nettoyage agressif si besoin via OCR_OCRMYPDF_ARGS
     extra = os.getenv("OCR_OCRMYPDF_ARGS", "").strip()
     if extra:
+        # permet d'injecter --deskew --clean etc sans toucher au code
         cmd[1:1] = shlex.split(extra)
+
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
-            return None
+            raise RuntimeError(f"ocrmypdf failed (code={proc.returncode}): {(proc.stderr or proc.stdout)[:800]}")
         if not Path(sidecar).exists():
-            return None
+            raise RuntimeError("ocrmypdf: sidecar manquant")
         text = Path(sidecar).read_text(encoding="utf-8", errors="ignore").strip()
-        if len(text) < 10:
-            return None
-        return text, None
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
+        if not text:
+            raise RuntimeError("ocrmypdf: sidecar vide")
+        return text
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ocrmypdf timeout: {e}") from e
+    except FileNotFoundError as e:
+        raise RuntimeError(f"ocrmypdf not found: {e}") from e
     finally:
         for p in (sidecar, output_pdf):
             try:
@@ -141,87 +97,37 @@ def _ocr_pdf_with_ocrmypdf(pdf_path: str, language: str) -> tuple[str, float | N
                 pass
 
 
-def _ocr_image_via_ocrmypdf(image_path: str, language: str) -> tuple[str, float | None] | None:
-    """Pour image (png/jpg) : convertit en PDF via img2pdf puis OCRmyPDF. Fallback si échec."""
-    if os.getenv("OCR_USE_OCRMYPDF", "1").strip() in {"0", "false", "no"}:
-        return None
+def _ocr_image_via_ocrmypdf(image_path: str, language: str) -> str:
+    """Image -> PDF (img2pdf) -> OCRmyPDF sidecar. Exclusif."""
     try:
-        import img2pdf  # lazy import
+        import img2pdf
+    except ImportError as e:
+        raise RuntimeError(f"img2pdf missing: {e}") from e
 
-        pdf_tmp = tempfile.mktemp(prefix="ocr_img_", suffix=".pdf")
+    pdf_tmp = tempfile.mktemp(prefix="ocr_img_", suffix=".pdf")
+    try:
         with open(image_path, "rb") as f:
-            # img2pdf gère correctement DPI et taille
             pdf_bytes = img2pdf.convert(f)
         Path(pdf_tmp).write_bytes(pdf_bytes)
-        result = _ocr_pdf_with_ocrmypdf(pdf_tmp, language)
-        try:
-            Path(pdf_tmp).unlink()
-        except Exception:
-            pass
-        return result
-    except Exception:
-        return None
-
-
-def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
-    """Lance tesseract avec prétraitement Pillow. PSM configurable via OCR_PSM (défaut 4 single column)."""
-    tesseract_bin = os.getenv("TESSERACT_BINARY", "tesseract")
-    psm = os.getenv("OCR_PSM", "4").strip()  # 4 = single column (CIP), 6 = uniform block — testé meilleur sur CIP
-    if psm not in {str(i) for i in range(14)}:
-        psm = "4"
-
-    # Prétraitement Pillow (upscale + contraste + binarisation) — fallback image brute si échec
-    preprocessed: str | None = None
-    ocr_image = image_path
-    if os.getenv("OCR_PREPROCESS", "1").strip() not in {"0", "false", "no"}:
-        preprocessed = _preprocess_image(image_path)
-        if preprocessed and Path(preprocessed).exists():
-            ocr_image = preprocessed
-
-    try:
-        cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", psm, "--oem", "1"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if proc.returncode != 0:
-            raise RuntimeError(f"tesseract failed: {proc.stderr[:500]}")
-        text = proc.stdout.strip()
-
-        # Fallback PSM 3 si texte trop court
-        if len(text) < 20 and psm in {"4", "6"}:
-            try:
-                fallback_cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", "3", "--oem", "1"]
-                fb_proc = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=30)
-                if fb_proc.returncode == 0 and len(fb_proc.stdout.strip()) > len(text):
-                    text = fb_proc.stdout.strip()
-            except Exception:
-                pass
-
-        confidence = None
-        try:
-            tsv_cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", psm, "--oem", "1", "tsv"]
-            tsv_proc = subprocess.run(tsv_cmd, capture_output=True, text=True, timeout=30)
-            if tsv_proc.returncode == 0:
-                lines = tsv_proc.stdout.strip().splitlines()
-                confs: list[int] = []
-                for line in lines[1:]:  # skip header
-                    parts = line.split("\t")
-                    if len(parts) >= 11:
-                        try:
-                            c = int(parts[10])
-                            if c >= 0:
-                                confs.append(c)
-                        except ValueError:
-                            continue
-                if confs:
-                    confidence = round(sum(confs) / len(confs), 2)
-        except Exception:
-            pass
-        return text, confidence
+        return _ocr_pdf_with_ocrmypdf(pdf_tmp, language)
     finally:
-        if preprocessed and Path(preprocessed).exists():
-            try:
-                Path(preprocessed).unlink()
-            except Exception:
-                pass
+        try:
+            if Path(pdf_tmp).exists():
+                Path(pdf_tmp).unlink()
+        except Exception:
+            pass
+
+
+def _extract_text(file_path: str, ext: str, language: str) -> tuple[str, float | None]:
+    """Route exclusivement OCRmyPDF selon l'extension. Retourne (text, None)."""
+    ext = ext.lower().lstrip(".")
+    if ext == "pdf":
+        text = _ocr_pdf_with_ocrmypdf(file_path, language)
+        return text, None
+    if ext in {"png", "jpg", "jpeg", "tiff", "bmp"}:
+        text = _ocr_image_via_ocrmypdf(file_path, language)
+        return text, None
+    raise RuntimeError(f"Extension non supportée pour OCRmyPDF: .{ext}")
 
 
 @app.get("/health")
@@ -232,6 +138,7 @@ def health() -> dict:
         ("pdftoppm", os.getenv("PDFTOPPM_PATH", "pdftoppm"), "-v"),
         ("ocrmypdf", "ocrmypdf", "--version"),
         ("ghostscript", "gs", "--version"),
+        ("unpaper", "unpaper", "--version"),
     ]:
         proc = subprocess.run(
             f"which {shlex.quote(bin_path)} 2>/dev/null; {shlex.quote(bin_path)} {ver_arg} 2>&1 | head -n1",
@@ -240,7 +147,7 @@ def health() -> dict:
             text=True,
         )
         checks[name] = proc.stdout.strip()[:200] or "not found"
-    return {"status": "ok", "service": "foncier-ocr", "version": "2.0.0-ocrmypdf", "checks": checks}
+    return {"status": "ok", "service": "foncier-ocr", "version": "3.0.0-ocrmypdf-exclusive", "checks": checks}
 
 
 @app.post("/extract")
@@ -253,7 +160,6 @@ async def extract(
     filename = file.filename or "upload"
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext not in ALLOWED_EXTENSIONS:
-        # tente de détecter via content_type
         if file.content_type and "pdf" in file.content_type:
             ext = "pdf"
         elif ext == "":
@@ -261,7 +167,6 @@ async def extract(
         else:
             raise HTTPException(status_code=400, detail=f"Extension non supportée: .{ext}")
 
-    # Sauvegarde temporaire
     suffix = f".{ext}"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -272,46 +177,23 @@ async def extract(
         tmp.write(content)
         tmp_path = tmp.name
 
-    generated_png: str | None = None
     try:
-        # 1) PDF : OCRmyPDF d'abord (deskew/clean + tesseract optimisé)
-        if ext == "pdf":
-            ocrmypdf_result = _ocr_pdf_with_ocrmypdf(tmp_path, lang)
-            if ocrmypdf_result is not None:
-                text, confidence = ocrmypdf_result
-                return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
-
-            # Fallback : pdftoppm + tesseract
-            generated_png = _convert_pdf_to_png(tmp_path)
-            image_path = generated_png
-            text, confidence = _run_tesseract(image_path, lang)
-            return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
-
-        # 2) Image : tenter OCRmyPDF via img2pdf, sinon tesseract direct
-        if ext in {"png", "jpg", "jpeg", "tiff", "bmp"}:
-            ocrmypdf_img = _ocr_image_via_ocrmypdf(tmp_path, lang)
-            if ocrmypdf_img is not None:
-                text, confidence = ocrmypdf_img
-                return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
-
-        text, confidence = _run_tesseract(tmp_path, lang)
+        text, confidence = _extract_text(tmp_path, ext, lang)
         return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="OCR timeout")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
-        for p in [tmp_path, generated_png]:
-            if p and Path(p).exists():
-                try:
-                    Path(p).unlink()
-                except Exception:
-                    pass
+        if Path(tmp_path).exists():
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
 
 
 def _ocr_and_callback(
     tmp_path: str,
-    generated_png: str | None,
     lang: str,
     filename: str,
     callback_url: str,
@@ -319,53 +201,27 @@ def _ocr_and_callback(
     job_id: str | None,
     document_id: str | None = None,
 ) -> None:
-    """Tâche de fond : OCR puis POST vers callback_url. PDF -> OCRmyPDF sidecar en priorité."""
+    """Tâche de fond exclusive OCRmyPDF puis POST vers callback_url."""
     try:
         ext = Path(tmp_path).suffix.lower().lstrip(".")
-        # Si c'était un PDF, tenter OCRmyPDF directement sur le fichier source
-        if ext == "pdf":
-            ocrmypdf_result = _ocr_pdf_with_ocrmypdf(tmp_path, lang)
-            if ocrmypdf_result is not None:
-                text, confidence = ocrmypdf_result
-                payload: dict = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
-                if document_id:
-                    payload["documentId"] = document_id
-                _post_callback(callback_url, callback_token, payload)
-                return
-            # Fallback tesseract sur PNG déjà converti ou à convertir
-            image_path = generated_png if generated_png and Path(generated_png).exists() else None
-            if image_path is None:
-                try:
-                    generated_png = _convert_pdf_to_png(tmp_path)
-                    image_path = generated_png
-                except Exception as e:
-                    _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": f"pdftoppm failed: {e}", "status": "error"})
-                    return
-            text, confidence = _run_tesseract(image_path, lang)
-        else:
-            # Image : tenter OCRmyPDF via img2pdf
-            ocrmypdf_img = _ocr_image_via_ocrmypdf(tmp_path, lang)
-            if ocrmypdf_img is not None:
-                text, confidence = ocrmypdf_img
-            else:
-                image_path = generated_png if generated_png and Path(generated_png).exists() else tmp_path
-                text, confidence = _run_tesseract(image_path, lang)
-
-        payload = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
+        # Si l'extension a été perdue (tmp sans suffix), deviner via filename
+        if ext not in ALLOWED_EXTENSIONS:
+            ext = Path(filename).suffix.lower().lstrip(".") or "pdf"
+        text, confidence = _extract_text(tmp_path, ext, lang)
+        payload: dict = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
         if document_id:
             payload["documentId"] = document_id
         _post_callback(callback_url, callback_token, payload)
     except subprocess.TimeoutExpired:
         _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": "OCR timeout", "status": "error"})
     except Exception as exc:
-        _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": str(exc)[:500], "status": "error"})
+        _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": str(exc)[:800], "status": "error"})
     finally:
-        for p in [tmp_path, generated_png]:
-            if p and Path(p).exists():
-                try:
-                    Path(p).unlink()
-                except Exception:
-                    pass
+        if Path(tmp_path).exists():
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
 
 
 def _post_callback(callback_url: str, callback_token: str | None, payload: dict) -> None:
@@ -373,7 +229,6 @@ def _post_callback(callback_url: str, callback_token: str | None, payload: dict)
     if callback_token:
         headers["Authorization"] = f"Bearer {callback_token}"
     try:
-        # Fire-and-forget, timeout 10s pour le POST callback
         httpx.post(callback_url, json=payload, headers=headers, timeout=10)
     except Exception:
         pass
@@ -390,7 +245,7 @@ async def receive(
     document_id: str = Form(default=""),
     _: None = Depends(verify_token),
 ) -> JSONResponse:
-    """Réception async : 202 immédiat puis OCR en tâche de fond qui rappelle callback_url."""
+    """Réception async : 202 immédiat puis OCRmyPDF en tâche de fond qui rappelle callback_url."""
     lang = _sanitize_language(language)
     filename = file.filename or "upload"
     ext = Path(filename).suffix.lower().lstrip(".")
@@ -412,23 +267,12 @@ async def receive(
         tmp.write(content)
         tmp_path = tmp.name
 
-    generated_png: str | None = None
-    # Pré-conversion PDF pour ne pas bloquer le thread principal sur pdftoppm
-    if ext == "pdf":
-        try:
-            generated_png = _convert_pdf_to_png(tmp_path)
-        except Exception as exc:
-            # On laisse la tâche de fond gérer l'erreur et notifier le callback
-            pass
-
-    # Validation callback_url
     if not callback_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="callback_url invalide")
 
     background_tasks.add_task(
         _ocr_and_callback,
         tmp_path,
-        generated_png,
         lang,
         filename,
         callback_url,
@@ -442,4 +286,4 @@ async def receive(
 
 @app.get("/")
 def root() -> dict:
-    return {"service": "foncier-ocr", "docs": "/docs", "health": "/health", "extract": "POST /extract"}
+    return {"service": "foncier-ocr", "docs": "/docs", "health": "/health", "extract": "POST /extract", "version": "3.0.0-ocrmypdf-exclusive"}
