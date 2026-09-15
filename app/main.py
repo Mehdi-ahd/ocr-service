@@ -9,6 +9,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPE
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
+from PIL import Image, ImageEnhance, ImageOps
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "bmp", "pdf"}
 ALLOWED_LANGUAGES = {"fra", "eng", "fra+eng", "eng+fra"}
@@ -51,6 +52,49 @@ def _sanitize_language(lang: str) -> str:
     return lang
 
 
+def _preprocess_image(image_path: str) -> str | None:
+    """Prétraitement Pillow inspiré de mayaram/laravel-ocr (image_preprocessing/auto_rotate/enhance_quality/remove_noise).
+
+    Étapes : grayscale -> upscale 2x si <2000px -> autocontrast -> contraste x1.6 -> median filter -> binarisation.
+    Retourne chemin pré-traité ou None si échec (fallback image brute).
+    """
+    try:
+        img = Image.open(image_path)
+
+        # Grayscale
+        if img.mode != "L":
+            img = img.convert("L")
+
+        # Upscale 2x si petite image (<2000px de large) — améliore nettement Tesseract
+        if img.width < 2000:
+            new_size = (img.width * 2, img.height * 2)
+            img = img.resize(new_size, Image.LANCZOS)
+
+        # Auto-contrast (équivalent auto_rotate/enhance_quality)
+        img = ImageOps.autocontrast(img, cutoff=0.5)
+
+        # Contraste x1.6
+        img = ImageEnhance.Contrast(img).enhance(1.6)
+
+        # Sharpen léger
+        img = img.filter(ImageFilter.SHARPEN)
+
+        # Median filter pour remove_noise
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+
+        # Binarisation simple (seuil 140) — nettoie le bruit de fond
+        threshold = int(os.getenv("OCR_BINARIZE_THRESHOLD", "140"))
+        if 0 < threshold < 255:
+            img = img.point(lambda p, t=threshold: 255 if p > t else 0, mode="L")
+
+        out = tempfile.mktemp(prefix="ocr_pre_", suffix=".png")
+        img.save(out, "PNG", dpi=(300, 300))
+
+        return out
+    except Exception:
+        return None
+
+
 def _convert_pdf_to_png(pdf_path: str) -> str:
     """Convertit la première page du PDF en PNG via pdftoppm. Retourne chemin PNG."""
     pdftoppm = os.getenv("PDFTOPPM_PATH", "pdftoppm")
@@ -64,36 +108,64 @@ def _convert_pdf_to_png(pdf_path: str) -> str:
 
 
 def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
-    """Lance tesseract et retourne (texte, confidence)."""
+    """Lance tesseract avec prétraitement Pillow. PSM configurable via OCR_PSM (défaut 6)."""
     tesseract_bin = os.getenv("TESSERACT_BINARY", "tesseract")
-    # --psm 3 (auto), --oem 1 (LSTM) par défaut
-    cmd = [tesseract_bin, image_path, "stdout", "-l", language, "--psm", "3"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if proc.returncode != 0:
-        raise RuntimeError(f"tesseract failed: {proc.stderr[:500]}")
-    text = proc.stdout.strip()
-    # Optionnel : extraire confidence via tsv si besoin
-    confidence = None
+    psm = os.getenv("OCR_PSM", "6").strip()  # 6 = single uniform block (CIP structurée), 3 = auto
+    if psm not in {str(i) for i in range(14)}:
+        psm = "6"
+
+    # Prétraitement Pillow (upscale + contraste + binarisation) — fallback image brute si échec
+    preprocessed: str | None = None
+    ocr_image = image_path
+    if os.getenv("OCR_PREPROCESS", "1").strip() not in {"0", "false", "no"}:
+        preprocessed = _preprocess_image(image_path)
+        if preprocessed and Path(preprocessed).exists():
+            ocr_image = preprocessed
+
     try:
-        tsv_cmd = [tesseract_bin, image_path, "stdout", "-l", language, "--psm", "3", "tsv"]
-        tsv_proc = subprocess.run(tsv_cmd, capture_output=True, text=True, timeout=30)
-        if tsv_proc.returncode == 0:
-            lines = tsv_proc.stdout.strip().splitlines()
-            confs: list[int] = []
-            for line in lines[1:]:  # skip header
-                parts = line.split("\t")
-                if len(parts) >= 11:
-                    try:
-                        c = int(parts[10])
-                        if c >= 0:
-                            confs.append(c)
-                    except ValueError:
-                        continue
-            if confs:
-                confidence = round(sum(confs) / len(confs), 2)
-    except Exception:
-        pass
-    return text, confidence
+        cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", psm, "--oem", "1"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            raise RuntimeError(f"tesseract failed: {proc.stderr[:500]}")
+        text = proc.stdout.strip()
+
+        # Si texte trop court et PSM 6, retry en PSM 3 (auto) — fallback documents non structurés
+        if len(text) < 20 and psm == "6":
+            try:
+                fallback_cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", "3", "--oem", "1"]
+                fb_proc = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=30)
+                if fb_proc.returncode == 0 and len(fb_proc.stdout.strip()) > len(text):
+                    text = fb_proc.stdout.strip()
+            except Exception:
+                pass
+
+        confidence = None
+        try:
+            tsv_cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", psm, "--oem", "1", "tsv"]
+            tsv_proc = subprocess.run(tsv_cmd, capture_output=True, text=True, timeout=30)
+            if tsv_proc.returncode == 0:
+                lines = tsv_proc.stdout.strip().splitlines()
+                confs: list[int] = []
+                for line in lines[1:]:  # skip header
+                    parts = line.split("\t")
+                    if len(parts) >= 11:
+                        try:
+                            c = int(parts[10])
+                            if c >= 0:
+                                confs.append(c)
+                        except ValueError:
+                            continue
+                if confs:
+                    confidence = round(sum(confs) / len(confs), 2)
+        except Exception:
+            pass
+        return text, confidence
+    finally:
+        if preprocessed and Path(preprocessed).exists():
+            try:
+                Path(preprocessed).unlink()
+            except Exception:
+                pass
 
 
 @app.get("/health")
