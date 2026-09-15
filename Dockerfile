@@ -6,12 +6,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# Tesseract OCR (fra+eng) + Poppler (pdftoppm) + deps
+# Tesseract (fra+eng) + Poppler + OCRmyPDF deps (ghostscript, unpaper, qpdf, pngquant)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-fra \
         tesseract-ocr-eng \
         poppler-utils \
+        ghostscript \
+        unpaper \
+        pngquant \
+        qpdf \
         curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

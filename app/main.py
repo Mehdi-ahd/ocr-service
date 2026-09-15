@@ -16,8 +16,8 @@ ALLOWED_LANGUAGES = {"fra", "eng", "fra+eng", "eng+fra"}
 
 app = FastAPI(
     title="Foncier OCR Micro-service",
-    description="Tesseract + pdftoppm — utilisé par Laravel OcrService en mode http (InfinityFree).",
-    version="1.0.0",
+    description="OCRmyPDF + Tesseract + pdftoppm — utilisé par Laravel OcrService en mode http (InfinityFree).",
+    version="2.0.0",
 )
 
 # CORS — autorise InfinityFree + local dev ; resserrer via OCR_CORS_ORIGINS si besoin
@@ -94,6 +94,73 @@ def _convert_pdf_to_png(pdf_path: str) -> str:
     if result.returncode != 0 or not Path(generated).exists():
         raise RuntimeError(f"pdftoppm failed (code={result.returncode}) for {pdf_path}")
     return generated
+
+
+def _ocr_pdf_with_ocrmypdf(pdf_path: str, language: str) -> tuple[str, float | None] | None:
+    """Tente OCRmyPDF --force-ocr avec sidecar. Retourne (text, None) ou None si échec/fallback."""
+    if os.getenv("OCR_USE_OCRMYPDF", "1").strip() in {"0", "false", "no"}:
+        return None
+    sidecar = tempfile.mktemp(prefix="ocr_sidecar_", suffix=".txt")
+    output_pdf = tempfile.mktemp(prefix="ocr_out_", suffix=".pdf")
+    # tesseract language pour ocrmypdf : fra ou fra+eng etc.
+    lang = language.strip() or "fra"
+    # OCRmyPDF : deskew, clean, oversample 300dpi, force-ocr
+    cmd = [
+        "ocrmypdf",
+        "--force-ocr",
+        "-l", lang,
+        "--optimize", "0",
+        "--output-type", "pdf",
+        "--sidecar", sidecar,
+        "--tesseract-timeout", "60",
+        pdf_path,
+        output_pdf,
+    ]
+    # Option: désactiver le nettoyage agressif si besoin via OCR_OCRMYPDF_ARGS
+    extra = os.getenv("OCR_OCRMYPDF_ARGS", "").strip()
+    if extra:
+        cmd[1:1] = shlex.split(extra)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            return None
+        if not Path(sidecar).exists():
+            return None
+        text = Path(sidecar).read_text(encoding="utf-8", errors="ignore").strip()
+        if len(text) < 10:
+            return None
+        return text, None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    finally:
+        for p in (sidecar, output_pdf):
+            try:
+                if Path(p).exists():
+                    Path(p).unlink()
+            except Exception:
+                pass
+
+
+def _ocr_image_via_ocrmypdf(image_path: str, language: str) -> tuple[str, float | None] | None:
+    """Pour image (png/jpg) : convertit en PDF via img2pdf puis OCRmyPDF. Fallback si échec."""
+    if os.getenv("OCR_USE_OCRMYPDF", "1").strip() in {"0", "false", "no"}:
+        return None
+    try:
+        import img2pdf  # lazy import
+
+        pdf_tmp = tempfile.mktemp(prefix="ocr_img_", suffix=".pdf")
+        with open(image_path, "rb") as f:
+            # img2pdf gère correctement DPI et taille
+            pdf_bytes = img2pdf.convert(f)
+        Path(pdf_tmp).write_bytes(pdf_bytes)
+        result = _ocr_pdf_with_ocrmypdf(pdf_tmp, language)
+        try:
+            Path(pdf_tmp).unlink()
+        except Exception:
+            pass
+        return result
+    except Exception:
+        return None
 
 
 def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
@@ -199,21 +266,28 @@ async def extract(
 
     generated_png: str | None = None
     try:
-        image_path = tmp_path
+        # 1) PDF : OCRmyPDF d'abord (deskew/clean + tesseract optimisé)
         if ext == "pdf":
+            ocrmypdf_result = _ocr_pdf_with_ocrmypdf(tmp_path, lang)
+            if ocrmypdf_result is not None:
+                text, confidence = ocrmypdf_result
+                return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
+
+            # Fallback : pdftoppm + tesseract
             generated_png = _convert_pdf_to_png(tmp_path)
             image_path = generated_png
+            text, confidence = _run_tesseract(image_path, lang)
+            return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
 
-        text, confidence = _run_tesseract(image_path, lang)
+        # 2) Image : tenter OCRmyPDF via img2pdf, sinon tesseract direct
+        if ext in {"png", "jpg", "jpeg", "tiff", "bmp"}:
+            ocrmypdf_img = _ocr_image_via_ocrmypdf(tmp_path, lang)
+            if ocrmypdf_img is not None:
+                text, confidence = ocrmypdf_img
+                return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
 
-        return JSONResponse(
-            {
-                "text": text,
-                "confidence": confidence,
-                "language": lang,
-                "filename": filename,
-            }
-        )
+        text, confidence = _run_tesseract(tmp_path, lang)
+        return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="OCR timeout")
     except RuntimeError as exc:
@@ -237,22 +311,39 @@ def _ocr_and_callback(
     job_id: str | None,
     document_id: str | None = None,
 ) -> None:
-    """Tâche de fond : OCR puis POST vers callback_url."""
+    """Tâche de fond : OCR puis POST vers callback_url. PDF -> OCRmyPDF sidecar en priorité."""
     try:
-        image_path = tmp_path
-        if generated_png and Path(generated_png).exists():
-            image_path = generated_png
-        elif Path(tmp_path).suffix.lower() == ".pdf":
-            # Si le PDF n'a pas été converti avant (fallback)
-            try:
-                generated_png = _convert_pdf_to_png(tmp_path)
-                image_path = generated_png
-            except Exception as e:
-                _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": f"pdftoppm failed: {e}", "status": "error"})
+        ext = Path(tmp_path).suffix.lower().lstrip(".")
+        # Si c'était un PDF, tenter OCRmyPDF directement sur le fichier source
+        if ext == "pdf":
+            ocrmypdf_result = _ocr_pdf_with_ocrmypdf(tmp_path, lang)
+            if ocrmypdf_result is not None:
+                text, confidence = ocrmypdf_result
+                payload: dict = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
+                if document_id:
+                    payload["documentId"] = document_id
+                _post_callback(callback_url, callback_token, payload)
                 return
+            # Fallback tesseract sur PNG déjà converti ou à convertir
+            image_path = generated_png if generated_png and Path(generated_png).exists() else None
+            if image_path is None:
+                try:
+                    generated_png = _convert_pdf_to_png(tmp_path)
+                    image_path = generated_png
+                except Exception as e:
+                    _post_callback(callback_url, callback_token, {"jobId": job_id, "documentId": document_id, "error": f"pdftoppm failed: {e}", "status": "error"})
+                    return
+            text, confidence = _run_tesseract(image_path, lang)
+        else:
+            # Image : tenter OCRmyPDF via img2pdf
+            ocrmypdf_img = _ocr_image_via_ocrmypdf(tmp_path, lang)
+            if ocrmypdf_img is not None:
+                text, confidence = ocrmypdf_img
+            else:
+                image_path = generated_png if generated_png and Path(generated_png).exists() else tmp_path
+                text, confidence = _run_tesseract(image_path, lang)
 
-        text, confidence = _run_tesseract(image_path, lang)
-        payload: dict = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
+        payload = {"jobId": job_id, "text": text, "confidence": confidence, "language": lang, "filename": filename, "status": "ok"}
         if document_id:
             payload["documentId"] = document_id
         _post_callback(callback_url, callback_token, payload)
