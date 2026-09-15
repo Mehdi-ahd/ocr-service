@@ -53,38 +53,27 @@ def _sanitize_language(lang: str) -> str:
 
 
 def _preprocess_image(image_path: str) -> str | None:
-    """Prétraitement Pillow inspiré de mayaram/laravel-ocr (image_preprocessing/auto_rotate/enhance_quality/remove_noise).
+    """Prétraitement léger Pillow (mayaram/laravel-ocr-like) : grayscale -> upscale 2x si <2000px -> autocontrast -> contraste x1.5 -> sharpen.
 
-    Étapes : grayscale -> upscale 2x si <2000px -> autocontrast -> contraste x1.6 -> median filter -> binarisation.
-    Retourne chemin pré-traité ou None si échec (fallback image brute).
+    Binarisation/median désactivés par défaut (provoquaient 6807→6307). Activer via OCR_BINARIZE_THRESHOLD=140 si besoin.
     """
     try:
         img = Image.open(image_path)
 
-        # Grayscale
         if img.mode != "L":
             img = img.convert("L")
 
-        # Upscale 2x si petite image (<2000px de large) — améliore nettement Tesseract
         if img.width < 2000:
-            new_size = (img.width * 2, img.height * 2)
-            img = img.resize(new_size, Image.LANCZOS)
+            img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
 
-        # Auto-contrast (équivalent auto_rotate/enhance_quality)
         img = ImageOps.autocontrast(img, cutoff=0.5)
-
-        # Contraste x1.6
-        img = ImageEnhance.Contrast(img).enhance(1.6)
-
-        # Sharpen léger
+        img = ImageEnhance.Contrast(img).enhance(1.5)
         img = img.filter(ImageFilter.SHARPEN)
 
-        # Median filter pour remove_noise
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-
-        # Binarisation simple (seuil 140) — nettoie le bruit de fond
-        threshold = int(os.getenv("OCR_BINARIZE_THRESHOLD", "140"))
+        # Opt-in : median + binarisation uniquement si seuil explicite
+        threshold = int(os.getenv("OCR_BINARIZE_THRESHOLD", "0"))
         if 0 < threshold < 255:
+            img = img.filter(ImageFilter.MedianFilter(size=3))
             img = img.point(lambda p, t=threshold: 255 if p > t else 0, mode="L")
 
         out = tempfile.mktemp(prefix="ocr_pre_", suffix=".png")
@@ -108,11 +97,11 @@ def _convert_pdf_to_png(pdf_path: str) -> str:
 
 
 def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
-    """Lance tesseract avec prétraitement Pillow. PSM configurable via OCR_PSM (défaut 6)."""
+    """Lance tesseract avec prétraitement Pillow. PSM configurable via OCR_PSM (défaut 4 single column)."""
     tesseract_bin = os.getenv("TESSERACT_BINARY", "tesseract")
-    psm = os.getenv("OCR_PSM", "6").strip()  # 6 = single uniform block (CIP structurée), 3 = auto
+    psm = os.getenv("OCR_PSM", "4").strip()  # 4 = single column (CIP), 6 = uniform block — testé meilleur sur CIP
     if psm not in {str(i) for i in range(14)}:
-        psm = "6"
+        psm = "4"
 
     # Prétraitement Pillow (upscale + contraste + binarisation) — fallback image brute si échec
     preprocessed: str | None = None
@@ -129,8 +118,8 @@ def _run_tesseract(image_path: str, language: str) -> tuple[str, float | None]:
             raise RuntimeError(f"tesseract failed: {proc.stderr[:500]}")
         text = proc.stdout.strip()
 
-        # Si texte trop court et PSM 6, retry en PSM 3 (auto) — fallback documents non structurés
-        if len(text) < 20 and psm == "6":
+        # Fallback PSM 3 si texte trop court
+        if len(text) < 20 and psm in {"4", "6"}:
             try:
                 fallback_cmd = [tesseract_bin, ocr_image, "stdout", "-l", language, "--psm", "3", "--oem", "1"]
                 fb_proc = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=30)
