@@ -3,6 +3,7 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +16,7 @@ ALLOWED_LANGUAGES = {"fra", "eng", "fra+eng", "eng+fra"}
 app = FastAPI(
     title="Foncier OCR Micro-service",
     description="OCRmyPDF exclusif (force-ocr + sidecar) — utilisé par Laravel OcrService en mode http (InfinityFree).",
-    version="3.0.0",
+    version="3.0.0-batch",
 )
 
 cors_origins = [o.strip() for o in os.getenv("OCR_CORS_ORIGINS", "*").split(",")]
@@ -130,68 +131,6 @@ def _extract_text(file_path: str, ext: str, language: str) -> tuple[str, float |
     raise RuntimeError(f"Extension non supportée pour OCRmyPDF: .{ext}")
 
 
-@app.get("/health")
-def health() -> dict:
-    checks: dict[str, str] = {}
-    for name, bin_path, ver_arg in [
-        ("tesseract", os.getenv("TESSERACT_BINARY", "tesseract"), "--version"),
-        ("pdftoppm", os.getenv("PDFTOPPM_PATH", "pdftoppm"), "-v"),
-        ("ocrmypdf", "ocrmypdf", "--version"),
-        ("ghostscript", "gs", "--version"),
-        ("unpaper", "unpaper", "--version"),
-    ]:
-        proc = subprocess.run(
-            f"which {shlex.quote(bin_path)} 2>/dev/null; {shlex.quote(bin_path)} {ver_arg} 2>&1 | head -n1",
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-        checks[name] = proc.stdout.strip()[:200] or "not found"
-    return {"status": "ok", "service": "foncier-ocr", "version": "3.0.0-ocrmypdf-exclusive", "checks": checks}
-
-
-@app.post("/extract")
-async def extract(
-    file: UploadFile = File(...),
-    language: str = Form(default="fra"),
-    _: None = Depends(verify_token),
-) -> JSONResponse:
-    lang = _sanitize_language(language)
-    filename = file.filename or "upload"
-    ext = Path(filename).suffix.lower().lstrip(".")
-    if ext not in ALLOWED_EXTENSIONS:
-        if file.content_type and "pdf" in file.content_type:
-            ext = "pdf"
-        elif ext == "":
-            ext = "png"
-        else:
-            raise HTTPException(status_code=400, detail=f"Extension non supportée: .{ext}")
-
-    suffix = f".{ext}"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Fichier vide")
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Fichier trop volumineux (max 10MB)")
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    try:
-        text, confidence = _extract_text(tmp_path, ext, lang)
-        return JSONResponse({"text": text, "confidence": confidence, "language": lang, "filename": filename})
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="OCR timeout")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        if Path(tmp_path).exists():
-            try:
-                Path(tmp_path).unlink()
-            except Exception:
-                pass
-
-
 def _ocr_and_callback(
     tmp_path: str,
     lang: str,
@@ -237,53 +176,66 @@ def _post_callback(callback_url: str, callback_token: str | None, payload: dict)
 @app.post("/receive")
 async def receive(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     language: str = Form(default="fra"),
     callback_url: str = Form(...),
     job_id: str = Form(default=""),
     callback_token: str = Form(default=""),
-    document_id: str = Form(default=""),
+    document_ids: Optional[List[str]] = Form(default=None),
     _: None = Depends(verify_token),
 ) -> JSONResponse:
-    """Réception async : 202 immédiat puis OCRmyPDF en tâche de fond qui rappelle callback_url."""
+    """Réception async batch : 202 immédiat puis OCRmyPDF en tâche de fond qui rappelle callback_url.
+    Accepte un ou plusieurs fichiers. Retourne une liste de jobId.
+    """
     lang = _sanitize_language(language)
-    filename = file.filename or "upload"
-    ext = Path(filename).suffix.lower().lstrip(".")
-    if ext not in ALLOWED_EXTENSIONS:
-        if file.content_type and "pdf" in file.content_type:
-            ext = "pdf"
-        elif ext == "":
-            ext = "png"
-        else:
-            raise HTTPException(status_code=400, detail=f"Extension non supportée: .{ext}")
+    if not callback_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="callback_url invalide")
 
-    suffix = f".{ext}"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    total_files = len(files)
+    jobs = []
+
+    for idx, file in enumerate(files):
+        filename = file.filename or "upload"
+        ext = Path(filename).suffix.lower().lstrip(".")
+        if ext not in ALLOWED_EXTENSIONS:
+            if file.content_type and "pdf" in file.content_type:
+                ext = "pdf"
+            elif ext == "":
+                ext = "png"
+            else:
+                raise HTTPException(status_code=400, detail=f"Extension non supportée: .{ext}")
+
         content = await file.read()
         if len(content) == 0:
             raise HTTPException(status_code=400, detail="Fichier vide")
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Fichier trop volumineux (max 10MB)")
-        tmp.write(content)
-        tmp_path = tmp.name
 
-    if not callback_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="callback_url invalide")
+        suffix = f".{ext}"
+        tmp_path = tempfile.mktemp(prefix="ocr_batch_", suffix=suffix)
+        with open(tmp_path, "wb") as f:
+            f.write(content)
 
-    background_tasks.add_task(
-        _ocr_and_callback,
-        tmp_path,
-        lang,
-        filename,
-        callback_url,
-        callback_token or None,
-        job_id or None,
-        document_id or None,
-    )
+        file_job_id = job_id if total_files == 1 else f"{job_id}_{idx}" if job_id else None
+        file_document_id = None
+        if document_ids and idx < len(document_ids):
+            file_document_id = document_ids[idx] or None
 
-    return JSONResponse({"received": True, "jobId": job_id or None, "filename": filename}, status_code=202)
+        background_tasks.add_task(
+            _ocr_and_callback,
+            tmp_path,
+            lang,
+            filename,
+            callback_url,
+            callback_token or None,
+            file_job_id,
+            file_document_id,
+        )
+        jobs.append({"jobId": file_job_id, "filename": filename})
+
+    return JSONResponse({"received": True, "jobs": jobs}, status_code=202)
 
 
 @app.get("/")
 def root() -> dict:
-    return {"service": "foncier-ocr", "docs": "/docs", "health": "/health", "extract": "POST /extract", "version": "3.0.0-ocrmypdf-exclusive"}
+    return {"service": "foncier-ocr", "docs": "/docs", "health": "/health", "extract": "POST /extract", "receive": "POST /receive (batch)", "version": "3.0.0-batch"}
